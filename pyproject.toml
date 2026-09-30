@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "session-handover"
+version = "0.1.0"
+description = "Hand off a coding-agent session to the next one: reads Claude Code and Codex CLI transcripts, generates a handover doc"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "hao li" }]
+keywords = ["claude-code", "codex", "cli", "session-management", "developer-tools"]
+
+[project.scripts]
+session-handover = "session_handover.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hahahahahahahahah6/session-handover"
+
+[tool.setuptools.packages.find]
+where = ["src"]
