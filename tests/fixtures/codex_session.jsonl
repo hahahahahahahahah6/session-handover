@@ -1,0 +1,8 @@
+{"type": "session_meta", "timestamp": "2026-09-29T23:01:00.000Z", "payload": {"id": "codex-xyz789", "cwd": "/home/test/demo"}}
+{"type": "response_item", "timestamp": "2026-09-29T23:01:05.000Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Refactor the database helper to use connection pooling"}]}}
+{"type": "response_item", "timestamp": "2026-09-29T23:01:20.000Z", "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "planning the refactor"}]}}
+{"type": "response_item", "timestamp": "2026-09-29T23:02:00.000Z", "payload": {"type": "function_call", "name": "apply_patch", "call_id": "c1", "arguments": "{\"patch\": \"*** Begin Patch\\n*** Update File: db.py\\n@@\\n-DB = connect()\\n+pool = make_pool()\\n*** End Patch\"}"}}
+{"type": "response_item", "timestamp": "2026-09-29T23:02:30.000Z", "payload": {"type": "function_call_output", "call_id": "c1", "status": "success", "output": "Updated 1 file"}}
+{"type": "response_item", "timestamp": "2026-09-29T23:03:00.000Z", "payload": {"type": "function_call", "name": "shell", "call_id": "c2", "arguments": "{\"command\": \"cd /home/test/demo && python -m pytest tests/test_db.py\"}"}}
+{"type": "response_item", "timestamp": "2026-09-29T23:03:40.000Z", "payload": {"type": "function_call_output", "call_id": "c2", "status": "error", "output": "FAILED tests/test_db.py::test_pool - Connection refused"}}
+{"type": "response_item", "timestamp": "2026-09-29T23:04:00.000Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "The refactor is in but tests need a live database, which isn't available here."}]}}
