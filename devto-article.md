@@ -81,3 +81,32 @@ markers are undocumented — a missed boundary is a silent miss, not a crash.
 29 tests pass, stdlib-only as before.
 
 If you also bounce between agents: what does your handover ritual look like? I'm curious what I missed.
+
+## Update (v0.3): the hook that writes the handover *before* /compact
+
+v0.2 audits what compaction dropped. v0.3 prevents the loss. The pattern is
+everywhere once you look: Silta's hand-written handoff+compaction process,
+Recall's pre-compact hook, the plan-mode Ask HN thread where people manually
+split `PLAN_*.md` files. When `/compact` fires, the session's durable state
+needs a structured handover written *before* the summary replaces context —
+and today that step is manual.
+
+One command:
+
+```bash
+session-handover hook-install precompact
+```
+
+On every `/compact`, the hook generates the standard handover from the
+transcript as it currently stands, then appends a "Durable items the next
+session must preserve" checklist — rules, TODOs, decisions, preferences,
+each citing its source turn — and writes it to
+`~/.cache/session-handover/precompact/HANDOVER.<session>.md`. Even if the
+auto-summary is lossy, the restore checklist is on disk.
+
+Fail-open by design: any failure prints a stderr note and exits 0. It never
+blocks compaction. Honest as ever: the hook protocol is undocumented and can
+drift (then the hook becomes a silent no-op), and the checklist inherits the
+audit's heuristic extraction limits — a safety net, not a guarantee.
+
+41 tests pass, stdlib-only as before.
