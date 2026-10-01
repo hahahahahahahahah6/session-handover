@@ -46,14 +46,46 @@ def _first_text(blocks):
     return ""
 
 
+_ERROR_RE = re.compile(
+    r"traceback"              # Python stack traces
+    r"|exception"             # SomethingException / "exception raised"
+    r"|error\s*:"             # "Error: ...", "ValueError: ...", "AssertionError: ..."
+    r"|failed\s+(with|exit)"  # "failed with exit code N", "command failed"
+    r"|exit\s*code\s*[1-9]"   # non-zero exit codes
+    r"|exited\s+with"         # "exited with status 1"
+    r"|command not found"
+    r"|permission denied"
+    r"|\benoent\b"
+    r"|\bpanic\b",            # Go/Rust panics
+    re.IGNORECASE,
+)
+
+
+# Injected meta wrappers Claude Code adds around tool output / reminders --
+# never a real user goal.
+_META_PREFIXES = ("<system-reminder", "<local-command-caveat", "<command-name")
+
+
+def _is_genuine_user_text(text):
+    """True for substantive user-authored text (not tool_result-only, empty,
+    or injected meta wrappers)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    lowered = t.lower()
+    return not lowered.startswith(_META_PREFIXES)
+
+
 def _looks_like_error(text):
+    """True only for text that actually indicates a failure.
+
+    Deliberately strict: a bare word like "error" shows up in ordinary file
+    content and prose ("error handling"), which used to turn every Read of
+    such a file into a false error entry.
+    """
     if not text:
         return False
-    t = text.lower()
-    return any(k in t for k in (
-        "error", "failed", "failure", "traceback", "exception",
-        "not found", "enoent", "permission denied", "command not found",
-    ))
+    return bool(_ERROR_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +125,12 @@ def parse_claude_code(path):
         if role == "user":
             user_count += 1
             if not first_user:
-                first_user = _first_text(content)[:2000]
+                # The first user message may be a tool_result-only or
+                # injected meta message; the goal is the first substantive
+                # user-authored text.
+                candidate = _first_text(content)
+                if _is_genuine_user_text(candidate):
+                    first_user = candidate.strip()[:2000]
             # tool results may carry errors
             if isinstance(content, list):
                 for b in content:
@@ -203,8 +240,8 @@ def parse_codex(path):
             text = _first_text(p.get("content", []))
             if role == "user":
                 user_count += 1
-                if not first_user:
-                    first_user = text[:2000]
+                if not first_user and _is_genuine_user_text(text):
+                    first_user = text.strip()[:2000]
                 if _looks_like_error(text):
                     errors.append(text[:500])
             elif role == "assistant":
@@ -253,6 +290,67 @@ def parse_codex(path):
 # Discovery
 # ---------------------------------------------------------------------------
 
+def _is_subagent_transcript(path):
+    """Best-effort detection of subagent (Task sidechain) transcripts.
+
+    Child agent runs are not sessions a user would hand over; listing them
+    as independent sessions is noise. Markers are checked defensively on raw
+    lines (no JSON parse needed) -- unknown markers simply never match.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= 200:
+                    break
+                if '"isSidechain": true' in line or '"isSidechain":true' in line:
+                    return True
+                if '"parentSessionId"' in line:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def peek(path):
+    """Cheap metadata scan for `list`: session_id, tool, started, cwd and an
+    approximate message count. Reads the file once but does no block-level
+    parsing, no error regex scans, and builds no action lists. Never raises.
+    """
+    info = {
+        "tool": "?",
+        "path": path,
+        "session_id": os.path.splitext(os.path.basename(path))[0],
+        "started": "",
+        "cwd": "",
+        "messages": 0,
+    }
+    try:
+        for obj in _lines(path):
+            otype = obj.get("type", "")
+            if otype in ("user", "assistant"):
+                info["tool"] = "claude-code"
+                info["messages"] += 1
+                info["started"] = info["started"] or obj.get("timestamp", "")
+                info["cwd"] = info["cwd"] or obj.get("cwd", "")
+                info["session_id"] = obj.get("sessionId") or info["session_id"]
+            elif otype == "session_meta":
+                info["tool"] = "codex"
+                meta = obj.get("payload") or {}
+                info["started"] = (info["started"] or obj.get("timestamp", "")
+                                   or meta.get("timestamp", ""))
+                info["cwd"] = info["cwd"] or meta.get("cwd", "") or obj.get("cwd", "")
+                info["session_id"] = meta.get("id") or info["session_id"]
+            elif otype == "response_item":
+                info["tool"] = "codex"
+                p = obj.get("payload")
+                if isinstance(p, dict) and p.get("type") == "message":
+                    info["messages"] += 1
+                info["started"] = info["started"] or obj.get("timestamp", "")
+    except Exception:
+        pass
+    return info
+
+
 def claude_dir():
     return os.environ.get(
         "SESSION_HANDOVER_CLAUDE_DIR",
@@ -274,17 +372,26 @@ def _iter_jsonl(root):
                 yield os.path.join(dirpath, fn)
 
 
-def discover():
-    """Return list of parsed session dicts, newest first. Never raises."""
+def discover(fast=False, include_subagents=False):
+    """Return list of session dicts, newest first. Never raises.
+
+    fast=True uses peek() (cheap metadata scan) instead of full parsing --
+    enough for `list`. Subagent (Task sidechain) transcripts are excluded
+    unless include_subagents=True.
+    """
     sessions = []
     for path in _iter_jsonl(claude_dir()):
+        if not include_subagents and _is_subagent_transcript(path):
+            continue
         try:
-            sessions.append(parse_claude_code(path))
+            sessions.append(peek(path) if fast else parse_claude_code(path))
         except Exception:
             continue
     for path in _iter_jsonl(codex_dir()):
+        if not include_subagents and _is_subagent_transcript(path):
+            continue
         try:
-            sessions.append(parse_codex(path))
+            sessions.append(peek(path) if fast else parse_codex(path))
         except Exception:
             continue
 

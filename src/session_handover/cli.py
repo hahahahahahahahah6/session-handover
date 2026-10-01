@@ -26,7 +26,7 @@ def _fmt_time(s):
 
 
 def cmd_list(args):
-    sessions = parsers.discover()
+    sessions = parsers.discover(fast=True)
     if not sessions:
         print("No sessions found.")
         print("Looked in:")
