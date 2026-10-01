@@ -11,6 +11,7 @@ import sys
 
 from . import parsers
 from . import compact_audit
+from . import precompact
 from .handover import generate
 
 
@@ -90,6 +91,23 @@ def cmd_audit_compact(args):
     return 0
 
 
+def cmd_hook_install(args):
+    command = precompact.hook_install()
+    print("Installed PreCompact hook:")
+    print("  %s" % command)
+    print("Settings: %s" % precompact.settings_path())
+    return 0
+
+
+def cmd_hook_uninstall(args):
+    removed = precompact.hook_uninstall()
+    if removed:
+        print("Removed PreCompact hook.")
+    else:
+        print("PreCompact hook was not installed; nothing to do.")
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="session-handover",
@@ -124,6 +142,24 @@ def build_parser():
                     help="Exit 1 when any item was dropped (for CI/hook "
                          "use). Default is exit 0: audit, never blocks.")
     pa.set_defaults(func=cmd_audit_compact)
+
+    pi = sub.add_parser("hook-install",
+                        help="Install the PreCompact hook: auto-write a "
+                             "handover (goal, timeline, durable-item "
+                             "checklist) before /compact runs. Merges into "
+                             "~/.claude/settings.json; idempotent.")
+    pi.add_argument("which", nargs="?", default="precompact",
+                    choices=["precompact"],
+                    help="Which hook to install (only 'precompact' for now).")
+    pi.set_defaults(func=cmd_hook_install)
+
+    pu = sub.add_parser("hook-uninstall",
+                        help="Remove the PreCompact hook installed by "
+                             "hook-install. Idempotent.")
+    pu.add_argument("which", nargs="?", default="precompact",
+                    choices=["precompact"],
+                    help="Which hook to uninstall (only 'precompact' for now).")
+    pu.set_defaults(func=cmd_hook_uninstall)
     return p
 
 
