@@ -58,6 +58,46 @@ SESSION_HANDOVER_CODEX_DIR=/path/to/codex/sessions \
   session-handover list
 ```
 
+## Compaction audit
+
+`/compact` silently drops things the session established. This is a real,
+reported failure mode: claude-code#67500 (compaction dropped project rules),
+claudefa.st's "What Survives /compact" survival table, and mikepurvis's HN
+thread asking for a formal framework of what survives compaction. Nobody
+audits the diff — so this does it mechanically:
+
+```bash
+$ session-handover audit-compact --session a4c2e901
+boundary 1: extracted=4 survived=2 dropped=2
+  DROPPED [rule] (turn 3): Never push to main without asking me first.
+    restore: Never push to main without asking me first.
+  DROPPED [rule] (turn 7): Always run the full test suite before committing.
+    restore: Always run the full test suite before committing.
+```
+
+How it works:
+
+1. **Boundary detection.** Walks the transcript for compaction events —
+   Claude Code's `{"type": "summary"}` entries and the "continued from a
+   previous conversation" preamble are both recognized; Codex transcripts
+   are scanned best-effort for compaction markers.
+2. **Durable-item extraction.** From the turns *before* each boundary, pulls
+   out candidate durable items — rules ("never do X", "always do Y"),
+   TODOs, decisions ("we'll use pytest"), and user preferences. Heuristic,
+   conservative, no LLM; every item cites its source turn number.
+3. **Survival check.** Each item is matched against the summary text that
+   replaced those turns. Matching is **token overlap** (≥50% of the item's
+   distinctive tokens must appear in the summary), not semantic similarity.
+   Items with no match are reported as **DROPPED**, each with a one-line
+   "suggested restore" (the original sentence) the next agent can paste
+   back into context.
+
+Exit code is always 0 — an audit never blocks — unless you pass
+`--fail-on-drop`, which exits 1 when anything dropped (for CI or hook use).
+Use `--out AUDIT.md` for the full Markdown report. Transcripts with no
+detectable compaction boundary print `No compaction boundary found` and
+exit 0 (fail-soft, not an error).
+
 ## How it works
 
 Claude Code stores each session as a `.jsonl` transcript; Codex CLI stores
@@ -83,6 +123,13 @@ side), and error signals. No LLM involved — it's fast, local, and private.
   is uploaded anywhere.
 - Session discovery uses file modification time for "most recent"; clock
   skew or copied files can misorder the list.
+- **The compaction audit is a recall floor, not a semantic reader.**
+  Extraction only catches explicitly stated rules ("never do X", "always
+  do Y"); subtly-phrased or implied constraints are missed. Matching is
+  token-overlap at a 0.5 threshold, not meaning — a summary that
+  rephrases a rule in different words is reported as dropped even when a
+  human would say it survived. Compaction markers are undocumented and
+  change; a missed boundary means a silent miss, not a crash.
 
 ## Development
 
