@@ -49,4 +49,35 @@ Neither transcript format is documented, and both drift. Codex's in particular h
 
 11 smoke tests pass, including fake fixtures for both transcript formats and a malformed-input test that asserts the parser never crashes on garbage.
 
+## Update (v0.2): audit what `/compact` drops
+
+There's a failure mode nobody audits. `/compact` silently drops things the
+session established — claude-code#67500 is literally "compaction dropped my
+project rules", claudefa.st keeps a "What Survives /compact" survival table,
+and mikepurvis asked on HN for a formal framework of what survives
+compaction. The summary that replaces your context is lossy, and nothing
+checks the diff.
+
+So v0.2 adds `session-handover audit-compact`:
+
+1. **Boundary detection** — finds compaction events in the transcript
+   (Claude Code's summary entries and the "continued from a previous
+   conversation" preamble; Codex best-effort).
+2. **Durable-item extraction** — from the turns *before* the boundary, pulls
+   out rules ("never push without asking"), TODOs, decisions, preferences,
+   each citing its source turn. Heuristic and conservative, no LLM.
+3. **Survival check** — matches each item against the replacement summary
+   text. Matching is token overlap (≥50% of distinctive tokens), not
+   semantic; misses are reported as DROPPED with the original sentence as a
+   one-line "suggested restore" the next agent can paste back.
+4. **Report** — terminal summary plus `--out AUDIT.md`; exit 0 always, or
+   `--fail-on-drop` for CI/hook use. No detectable boundary prints a clear
+   message and exits 0 instead of erroring.
+
+Honest as ever: extraction misses subtly-phrased rules, token overlap is
+not meaning (a reworded-but-surviving rule gets flagged), and compaction
+markers are undocumented — a missed boundary is a silent miss, not a crash.
+
+29 tests pass, stdlib-only as before.
+
 If you also bounce between agents: what does your handover ritual look like? I'm curious what I missed.
