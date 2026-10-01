@@ -199,6 +199,97 @@ def test_discover_excludes_subagents_and_peek_matches():
     print("discover excludes subagents / peek ok")
 
 
+def test_read_result_with_except_exception_not_flagged():
+    # Regression: a Read tool_result whose file content contains
+    # "except Exception" (is_error=false) must NOT be logged as an error.
+    # The exception-keyword heuristic applies to Bash results only.
+    import tempfile
+    objs = [
+        _claude_msg("s4", "user", [{"type": "text", "text": "read the module"}]),
+        _claude_msg("s4", "assistant", [{"type": "tool_use", "id": "t1",
+                                        "name": "Read",
+                                        "input": {"file_path": "/x/app.py"}}]),
+        _claude_msg("s4", "user", [{"type": "tool_result", "tool_use_id": "t1",
+                                    "is_error": False,
+                                    "content": "def main():\n"
+                                               "    try:\n"
+                                               "        run()\n"
+                                               "    except Exception as e:\n"
+                                               "        raise RuntimeError("
+                                               "'failed') from e\n"}]),
+        # Same content via Edit must also stay quiet ...
+        _claude_msg("s4", "assistant", [{"type": "tool_use", "id": "t2",
+                                        "name": "Edit",
+                                        "input": {"file_path": "/x/app.py"}}]),
+        _claude_msg("s4", "user", [{"type": "tool_result", "tool_use_id": "t2",
+                                    "content": "File updated: except "
+                                               "Exception handled"}]),
+        # ... while a real Bash traceback is still caught.
+        _claude_msg("s4", "assistant", [{"type": "tool_use", "id": "t3",
+                                        "name": "Bash",
+                                        "input": {"command": "pytest"}}]),
+        _claude_msg("s4", "user", [{"type": "tool_result", "tool_use_id": "t3",
+                                    "content": "Traceback (most recent call "
+                                               "last):\n"
+                                               "ValueError: bad config"}]),
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        _write_jsonl(fh.name, objs)
+        path = fh.name
+    try:
+        s = parsers.parse_claude_code(path)
+        assert len(s["errors"]) == 1, s["errors"]
+        assert "Traceback" in s["errors"][0]
+    finally:
+        os.remove(path)
+    print("read except-Exception not flagged / bash traceback flagged ok")
+
+
+def test_codex_read_output_with_exception_word_not_flagged():
+    # Codex side: function_call_output from a read-like tool whose output
+    # mentions "exception" (status success) is not an error; shell output
+    # with a traceback still is.
+    import tempfile
+    objs = [
+        {"type": "session_meta", "timestamp": "2026-10-01T00:00:00Z",
+         "payload": {"id": "cx1", "cwd": "/x"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call", "name": "read_file",
+                     "call_id": "c1", "arguments": "{\"path\": \"/x/a.py\"}"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call_output", "call_id": "c1",
+                     "status": "success",
+                     "output": "try:\n    f()\nexcept Exception:\n"
+                               "    pass"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call", "name": "shell",
+                     "call_id": "c2",
+                     "arguments": "{\"command\": \"pytest\"}"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call_output", "call_id": "c2",
+                     "status": "success",
+                     "output": "Traceback (most recent call last):\n"
+                               "AssertionError: boom"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call", "name": "read_file",
+                     "call_id": "c3", "arguments": "{\"path\": \"/x/b.py\"}"}},
+        {"type": "response_item",
+         "payload": {"type": "function_call_output", "call_id": "c3",
+                     "status": "error", "output": "permission denied"}},
+    ]
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+        _write_jsonl(fh.name, objs)
+        path = fh.name
+    try:
+        s = parsers.parse_codex(path)
+        assert len(s["errors"]) == 2, s["errors"]
+        assert any("Traceback" in e for e in s["errors"])
+        assert any("permission denied" in e for e in s["errors"])
+    finally:
+        os.remove(path)
+    print("codex read output not flagged / shell+status errors flagged ok")
+
+
 if __name__ == "__main__":
     test_parse_claude_code_fixture()
     test_parse_codex_fixture()
@@ -208,5 +299,7 @@ if __name__ == "__main__":
     test_file_content_with_error_word_not_flagged()
     test_real_errors_still_flagged()
     test_goal_skips_tool_result_and_meta_first_messages()
+    test_read_result_with_except_exception_not_flagged()
+    test_codex_read_output_with_exception_word_not_flagged()
     test_discover_excludes_subagents_and_peek_matches()
     print("ALL PARSER TESTS PASSED")

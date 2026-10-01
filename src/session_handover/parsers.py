@@ -76,6 +76,25 @@ def _is_genuine_user_text(text):
     return not lowered.startswith(_META_PREFIXES)
 
 
+# Tool-name hints identifying shell/command runners. The exception-keyword
+# heuristic below is ONLY applied to results from these tools: running it
+# over Read/Edit/Write output turns ordinary source text (e.g. a .py file
+# containing "except Exception") into phantom errors.
+_SHELL_HINTS = ("shell", "exec", "bash", "command", "run")
+
+
+def _is_shell_tool(tool_name):
+    """True when a tool result came from a shell/command runner.
+
+    Unknown/empty tool names (truncated transcript, malformed tool_use)
+    return True: for a result we cannot attribute, keep the legacy keyword
+    heuristic rather than silently dropping a real error.
+    """
+    if not tool_name:
+        return True
+    return any(k in str(tool_name).lower() for k in _SHELL_HINTS)
+
+
 def _looks_like_error(text):
     """True only for text that actually indicates a failure.
 
@@ -111,6 +130,7 @@ def parse_claude_code(path):
     session_id = os.path.splitext(os.path.basename(path))[0]
     counts = {"edits": 0, "writes": 0, "commands": 0, "reads": 0}
     files = []
+    tool_names = {}  # tool_use id -> tool name, to attribute tool_results
 
     for obj in _lines(path):
         started = started or obj.get("timestamp", "")
@@ -131,13 +151,20 @@ def parse_claude_code(path):
                 candidate = _first_text(content)
                 if _is_genuine_user_text(candidate):
                     first_user = candidate.strip()[:2000]
-            # tool results may carry errors
+            # tool results may carry errors. The exception-keyword heuristic
+            # is only meaningful for shell output: for Read/Edit/Write and
+            # friends the error status comes solely from is_error, so that
+            # ordinary source text (e.g. "except Exception" in a .py file)
+            # is never logged as an error.
             if isinstance(content, list):
                 for b in content:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
                         c = b.get("content")
                         txt = c if isinstance(c, str) else _first_text(c)
-                        if b.get("is_error") or _looks_like_error(txt):
+                        from_shell = _is_shell_tool(
+                            tool_names.get(b.get("tool_use_id"), ""))
+                        if b.get("is_error") or (from_shell
+                                                 and _looks_like_error(txt)):
                             errors.append(txt[:500])
         elif role == "assistant":
             assistant_count += 1
@@ -147,6 +174,8 @@ def parse_claude_code(path):
                         continue
                     if b.get("type") == "tool_use":
                         name = b.get("name", "tool")
+                        if b.get("id"):
+                            tool_names[b["id"]] = name
                         inp = b.get("input") or {}
                         if not isinstance(inp, dict):
                             inp = {}
@@ -218,6 +247,7 @@ def parse_codex(path):
     session_id = os.path.splitext(os.path.basename(path))[0]
     counts = {"edits": 0, "writes": 0, "commands": 0, "reads": 0}
     files = []
+    call_names = {}  # function_call call_id -> function name
 
     for obj in _lines(path):
         otype = obj.get("type", "")
@@ -242,12 +272,16 @@ def parse_codex(path):
                 user_count += 1
                 if not first_user and _is_genuine_user_text(text):
                     first_user = text.strip()[:2000]
-                if _looks_like_error(text):
-                    errors.append(text[:500])
+                # Note: no keyword-based error detection on user messages --
+                # the heuristic is reserved for shell tool output only, so a
+                # user pasting a traceback to ask about it is not logged as
+                # a session error.
             elif role == "assistant":
                 assistant_count += 1
         elif ptype == "function_call":
             name = p.get("name", "tool")
+            if p.get("call_id"):
+                call_names[p["call_id"]] = name
             summary = _codex_args_summary(name, p.get("arguments", ""))
             nl = name.lower()
             if any(k in nl for k in ("patch", "edit", "write", "apply")):
@@ -267,7 +301,12 @@ def parse_codex(path):
             out = p.get("output")
             txt = out if isinstance(out, str) else str(out or "")[:500]
             status = str(p.get("status", "")).lower()
-            if status not in ("", "success", "completed", "ok") or _looks_like_error(txt):
+            bad_status = status not in ("", "success", "completed", "ok")
+            # Keyword heuristic only for shell output; other tools are
+            # judged by status alone so their output text (e.g. source
+            # code mentioning "exception") is never a phantom error.
+            from_shell = _is_shell_tool(call_names.get(p.get("call_id"), ""))
+            if bad_status or (from_shell and _looks_like_error(txt)):
                 errors.append(txt[:500])
         # "reasoning" and anything else: intentionally ignored
 
