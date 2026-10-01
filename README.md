@@ -98,6 +98,44 @@ Use `--out AUDIT.md` for the full Markdown report. Transcripts with no
 detectable compaction boundary print `No compaction boundary found` and
 exit 0 (fail-soft, not an error).
 
+## PreCompact auto-handover
+
+v0.2 audits what compaction dropped. v0.3 prevents the loss: a PreCompact
+hook writes the handover **before** the summary replaces context. The pain
+is well documented — Silta's hand-written handoff+compaction process,
+Recall's pre-compact hook, and the plan-mode Ask HN thread where people
+manually split `PLAN_*.md` files all show the same thing: when `/compact`
+fires, the session's durable state needs a structured handover written
+*before* compaction, and today it's manual.
+
+One command installs it:
+
+```bash
+$ session-handover hook-install precompact
+Installed PreCompact hook:
+  python3 /home/you/session-handover/hooks/precompact.py
+Settings: /home/you/.claude/settings.json
+```
+
+This merges a `PreCompact` entry into `~/.claude/settings.json` without
+touching your other hooks (idempotent — re-running never duplicates it;
+`hook-uninstall precompact` removes it). On every `/compact`, the hook:
+
+1. Generates the standard handover (goal, timeline, files touched, errors,
+   open items) from the transcript **as it currently stands**.
+2. Appends a **"Durable items the next session must preserve"** checklist —
+   rules, TODOs, decisions, preferences extracted from the recent turns,
+   each citing its source turn — so even if the auto-summary is lossy, the
+   restore checklist is on disk.
+3. Writes it to `~/.cache/session-handover/precompact/HANDOVER.<session>.md`
+   (override the directory with `SESSION_HANDOVER_DIR`).
+
+The hook is **fail-open**: any failure — garbage stdin, missing transcript,
+unparseable format — prints a stderr note and exits 0. It never blocks
+compaction. Extraction is capped to the most recent 300 text turns
+(`SESSION_HANDOVER_WINDOW` to tune) so the hook stays fast on large
+transcripts.
+
 ## How it works
 
 Claude Code stores each session as a `.jsonl` transcript; Codex CLI stores
@@ -130,12 +168,20 @@ side), and error signals. No LLM involved — it's fast, local, and private.
   rephrases a rule in different words is reported as dropped even when a
   human would say it survived. Compaction markers are undocumented and
   change; a missed boundary means a silent miss, not a crash.
+- **The PreCompact hook protocol is undocumented.** The `session_id` /
+  `transcript_path` JSON shape on stdin comes from community documentation
+  of Claude Code's hook protocol, not a stable API. If the protocol changes,
+  the hook degrades to a no-op (fail-open). The pre-compaction checklist
+  inherits the audit's extraction limits — it is a heuristic safety net,
+  not a guarantee that nothing was lost.
 
 ## Development
 
 ```bash
 python3 tests/test_parsers.py
 python3 tests/test_cli.py
+python3 tests/test_compact_audit.py
+python3 tests/test_precompact.py
 ```
 
 ## License
