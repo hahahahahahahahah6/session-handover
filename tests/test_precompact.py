@@ -217,6 +217,66 @@ def test_cli_hook_install_uninstall():
     print("cli hook-install/uninstall ok")
 
 
+def test_hook_install_uses_running_interpreter_not_plain_python3():
+    """Regression: hook-install must register sys.executable, not "python3".
+
+    With a pipx/venv/uv install, the system python3 has no session_handover
+    package, so a hardcoded "python3 <shim>" hook fail-opens on every
+    /compact and the user believes they are protected. Install the package
+    into a real venv, run hook-install with the venv's interpreter, and
+    assert the registered command points at that interpreter -- then run
+    the registered command and assert the hook actually fires.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("python3") is None:
+        print("SKIP: no python3 for venv test")
+        return
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    with tempfile.TemporaryDirectory() as tmp:
+        venv = os.path.join(tmp, "venv")
+        subprocess.run([sys.executable, "-m", "venv", venv], check=True,
+                       capture_output=True)
+        vpy = os.path.join(venv, "bin", "python")
+        subprocess.run([vpy, "-m", "pip", "install", "--quiet", repo],
+                       check=True, capture_output=True)
+        home = os.path.join(tmp, "home")
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        out_dir = os.path.join(tmp, "out")
+        env = dict(os.environ, HOME=home, SESSION_HANDOVER_DIR=out_dir)
+        cli_bin = os.path.join(venv, "bin", "session-handover")
+        subprocess.run([cli_bin, "hook-install", "precompact"],
+                       check=True, env=env, capture_output=True)
+        with open(os.path.join(home, ".claude", "settings.json"),
+                  encoding="utf-8") as fh:
+            data = json.load(fh)
+        commands = [h["command"] for e in data["hooks"]["PreCompact"]
+                    for h in e["hooks"]]
+        assert len(commands) == 1, commands
+        cmd = commands[0]
+        # Must invoke the venv's interpreter -- never a bare "python3".
+        assert not cmd.startswith("python3 "), cmd
+        assert cmd.startswith(vpy + " "), cmd
+
+        # The registered command really fires under the venv interpreter:
+        # the package is importable there, so a HANDOVER file is written.
+        tpath = os.path.join(tmp, "t.jsonl")
+        _claude_transcript(tpath)
+        proc = subprocess.run(
+            cmd, shell=True,
+            input=json.dumps({"session_id": "venv-e2e",
+                              "transcript_path": tpath}),
+            capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stderr
+        written = os.path.join(out_dir, "HANDOVER.venv-e2e.md")
+        assert os.path.isfile(written), \
+            "hook did not fire: %s" % proc.stderr
+        with open(written, encoding="utf-8") as fh:
+            assert "# Session Handover" in fh.read()
+    print("hook_install uses running interpreter ok")
+
+
 def test_shim_is_stdlib_only_single_file():
     shim = os.path.join(os.path.dirname(__file__), "..", "hooks",
                         "precompact.py")
@@ -245,5 +305,6 @@ if __name__ == "__main__":
     test_hook_install_uninstall_idempotent()
     test_hook_install_merges_with_existing_precompact()
     test_cli_hook_install_uninstall()
+    test_hook_install_uses_running_interpreter_not_plain_python3()
     test_shim_is_stdlib_only_single_file()
     print("ALL PRECOMPACT TESTS PASSED")

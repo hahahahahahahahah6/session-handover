@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "session-handover"
-version = "0.3.0"
+version = "0.3.1"
 description = "Hand off a coding-agent session to the next one: reads Claude Code and Codex CLI transcripts, generates a handover doc"
 readme = "README.md"
 requires-python = ">=3.9"

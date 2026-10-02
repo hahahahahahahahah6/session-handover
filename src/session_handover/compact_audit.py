@@ -7,7 +7,10 @@ mikepurvis's HN thread asking for a formal framework of what survives
 compaction). Nothing audits that diff, so this does it mechanically.
 
 Pipeline:
-  1. Walk the transcript, find compaction boundaries (summary entries).
+  1. Walk the transcript, find compaction boundaries: real /compact
+     markers (system compact_boundary, isCompactSummary messages) and the
+     continuation preamble. Bare {"type": "summary"} lines are session
+     titles, not compactions, unless markers are present.
   2. From the turns BEFORE each boundary, heuristically extract candidate
      durable items: rules/constraints, TODOs, decisions, user preferences.
   3. Check each item against the summary text that REPLACES those turns.
@@ -25,9 +28,16 @@ import re
 from . import parsers
 
 # A compaction boundary is where earlier turns were replaced by a summary.
-# Claude Code writes summary entries into the transcript when it compacts;
-# a resumed session also starts with a well-known continuation preamble.
+# Real /compact evidence (undocumented, from observed transcripts):
+#   - a system entry with subtype "compact_boundary", and/or
+#   - a user entry flagged isCompactSummary carrying the replacement text.
+# Bare {"type": "summary"} lines are session TITLES (the /resume list), not
+# compactions -- they only count as boundaries when the transcript also
+# carries real compaction markers (see _has_compact_markers). A resumed
+# session also starts with a well-known continuation preamble, which is
+# kept as a boundary (verified correct).
 _SUMMARY_TYPE = "summary"
+_COMPACT_BOUNDARY_SUBTYPE = "compact_boundary"
 _CONTINUATION_PREFIXES = (
     "this session is being continued from a previous conversation",
     "this conversation is being continued from a previous session",
@@ -38,21 +48,44 @@ _CONTINUATION_PREFIXES = (
 _COMPACT_MARKERS = ("compacted", "compacting", "/compact")
 
 
-def _claude_events(path):
+def _has_compact_markers(path):
+    """True if the transcript contains real /compact evidence.
+
+    A real /compact writes a system entry with subtype "compact_boundary"
+    and injects a user message flagged isCompactSummary. Without either,
+    bare {"type": "summary"} lines are just session titles.
+    """
+    for obj in parsers._lines(path):
+        if obj.get("subtype") == _COMPACT_BOUNDARY_SUBTYPE:
+            return True
+        if obj.get("isCompactSummary"):
+            return True
+    return False
+
+
+def _claude_events(path, summaries_are_boundaries=True):
     """Yield (kind, text) events in transcript order for a Claude transcript.
 
     kind is one of "text" (user/assistant text, pre- or post-compact) or
     "summary" (a compaction boundary whose text is the replacement summary).
+
+    summaries_are_boundaries: only True when the transcript carries real
+    compaction markers. Bare type=summary lines are session titles; they
+    are skipped unless markers exist, and a summary before any text turn
+    replaces nothing so it can never be a boundary. The isCompactSummary
+    user message and the continuation preamble are always boundaries.
     """
+    seen_text = False
     for obj in parsers._lines(path):
         otype = obj.get("type", "")
         if otype == _SUMMARY_TYPE:
-            # Known shape: {"type": "summary", "summary": "...", ...}.
-            # Be tolerant: look for the text under a few plausible keys.
-            text = (obj.get("summary") or obj.get("text")
-                    or obj.get("content") or "")
-            if isinstance(text, str) and text.strip():
-                yield ("summary", text.strip())
+            if summaries_are_boundaries and seen_text:
+                # Known shape: {"type": "summary", "summary": "...", ...}.
+                # Be tolerant: look for the text under a few plausible keys.
+                text = (obj.get("summary") or obj.get("text")
+                        or obj.get("content") or "")
+                if isinstance(text, str) and text.strip():
+                    yield ("summary", text.strip())
             continue
         if otype not in ("user", "assistant"):
             continue
@@ -65,12 +98,20 @@ def _claude_events(path):
         text = parsers._first_text(msg.get("content", []))
         if not parsers._is_genuine_user_text(text):
             continue
+        if obj.get("isCompactSummary"):
+            # The injected post-/compact summary: a real boundary.
+            # Checked before the continuation preamble so the same message
+            # is never counted twice (real injected summaries start with
+            # the preamble text).
+            yield ("summary", text.strip())
+            continue
         lowered = text.strip().lower()
         if any(lowered.startswith(p) for p in _CONTINUATION_PREFIXES):
             # Continuation preamble: the rest of this message is the
             # compacted summary of everything before it.
             yield ("summary", text.strip())
             continue
+        seen_text = True
         yield ("text", text.strip())
 
 
@@ -116,8 +157,16 @@ def find_boundaries(path, tool):
     (i.e. the summary appears right after it). turn_index is 1-based and
     counts only text-bearing turns plus summaries, so it can be used to
     cite the source in the original transcript.
+
+    Bare {"type": "summary"} lines (session titles) are only treated as
+    boundaries when the transcript carries real compaction markers
+    (system compact_boundary / isCompactSummary); see _has_compact_markers.
     """
-    events = _claude_events(path) if tool == "claude-code" else _codex_events(path)
+    if tool == "claude-code":
+        events = _claude_events(
+            path, summaries_are_boundaries=_has_compact_markers(path))
+    else:
+        events = _codex_events(path)
     turns = []
     boundaries = []
     for kind, text in events:

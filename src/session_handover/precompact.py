@@ -27,6 +27,7 @@ parsing is a single linear pass. No LLM, no network, stdlib only.
 import json
 import os
 import re
+import shlex
 import sys
 
 from . import parsers
@@ -192,10 +193,15 @@ def hook_main(stdin_text=None):
 # Hook installation into ~/.claude/settings.json
 # ---------------------------------------------------------------------------
 
-# Command registered in settings.json. Kept as a plain "python3 <shim>"
-# string so idempotency checks can compare it exactly.
+# Command registered in settings.json. Uses the absolute path of the
+# interpreter that ran hook-install (sys.executable), NOT a bare "python3":
+# with pipx/venv/uv installs the system python3 has no session_handover
+# package, so a hardcoded "python3 <shim>" hook would fail-open on every
+# /compact while the user believes they are protected. Kept as an exact
+# string so idempotency checks can compare it.
 def _hook_command():
-    return "python3 %s" % _shim_path()
+    return "%s %s" % (shlex.quote(sys.executable),
+                      shlex.quote(_shim_path()))
 
 
 def _package_dir():

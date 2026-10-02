@@ -25,7 +25,13 @@ def _claude_msg(sid, role, text, ts="2026-10-01T00:00:00Z"):
 
 
 def _compact_fixture(path):
-    """Claude transcript: 4 text turns, then a summary compaction boundary."""
+    """Realistic Claude transcript: 4 text turns, then a /compact.
+
+    A real /compact writes a system entry with subtype "compact_boundary"
+    and injects a user message flagged isCompactSummary carrying the
+    replacement summary. Bare {"type": "summary"} lines are session
+    titles (the /resume list), NOT compactions.
+    """
     objs = [
         _claude_msg("c1", "user",
                     "Refactor the auth module. "
@@ -38,9 +44,15 @@ def _compact_fixture(path):
                     "anything."),
         _claude_msg("c1", "assistant",
                     "Got it. We'll use pytest for the tests."),
-        {"type": "summary", "sessionId": "c1",
+        {"type": "system", "subtype": "compact_boundary", "sessionId": "c1",
          "timestamp": "2026-10-01T01:00:00Z",
-         "summary": "Refactored the auth module. Used pytest for tests."},
+         "compactMetadata": {"trigger": "manual", "preTokens": 45000}},
+        {"type": "user", "sessionId": "c1", "isCompactSummary": True,
+         "timestamp": "2026-10-01T01:00:01Z",
+         "message": {"role": "user",
+                     "content": [{"type": "text",
+                                  "text": "Refactored the auth module. "
+                                          "Used pytest for tests."}]}},
         _claude_msg("c1", "user", "Now add rate limiting."),
     ]
     _write_jsonl(path, objs)
@@ -278,6 +290,91 @@ def test_reworded_rule_is_dropped():
     print("reworded rule dropped (documented limitation) ok")
 
 
+def test_session_title_lines_are_not_boundaries():
+    """Regression: bare {"type": "summary"} lines are /resume session
+    titles, not compactions. A titled session with no compaction markers
+    must yield zero boundaries (previously every title produced a bogus
+    boundary and all earlier rules reported DROPPED)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.jsonl")
+        objs = [
+            {"type": "summary", "sessionId": "t1", "leafUuid": "leaf-1",
+             "summary": "Billing refactor"},
+            _claude_msg("t1", "user", "Never edit the vendor directory."),
+            _claude_msg("t1", "assistant", "Understood, leaving it alone."),
+            {"type": "summary", "sessionId": "t1", "leafUuid": "leaf-2",
+             "summary": "Billing refactor, continued"},
+            _claude_msg("t1", "user", "Now write the deploy script."),
+        ]
+        _write_jsonl(path, objs)
+        turns, boundaries = compact_audit.find_boundaries(path, "claude-code")
+        assert boundaries == [], boundaries
+        assert len(turns) == 3
+        result = compact_audit.audit(path, "claude-code")
+        assert result["boundaries"] == []
+    print("session titles are not boundaries ok")
+
+
+def test_compact_boundary_markers_are_boundary():
+    """Real /compact markers -- system compact_boundary plus the injected
+    isCompactSummary user message -- produce exactly one boundary carrying
+    the summary text, even with a session title present."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.jsonl")
+        objs = [
+            {"type": "summary", "sessionId": "c1", "leafUuid": "leaf-1",
+             "summary": "Auth work"},  # session title: not a boundary
+            _claude_msg("c1", "user",
+                        "Refactor the auth module. "
+                        "Never push to main without asking me first."),
+            _claude_msg("c1", "assistant", "On it."),
+            {"type": "system", "subtype": "compact_boundary",
+             "sessionId": "c1", "timestamp": "2026-10-01T01:00:00Z",
+             "compactMetadata": {"trigger": "manual", "preTokens": 45000}},
+            {"type": "user", "sessionId": "c1", "isCompactSummary": True,
+             "timestamp": "2026-10-01T01:00:01Z",
+             "message": {"role": "user",
+                         "content": [{"type": "text",
+                                      "text": "Refactored the auth module. "
+                                              "Used pytest for tests."}]}},
+            _claude_msg("c1", "user", "Now add rate limiting."),
+        ]
+        _write_jsonl(path, objs)
+        turns, boundaries = compact_audit.find_boundaries(path, "claude-code")
+        assert len(boundaries) == 1, boundaries
+        assert boundaries[0][0] == 2  # replaces the 2 pre-compact turns
+        assert "Refactored the auth module" in boundaries[0][1]
+        assert len(turns) == 3  # 2 pre-compact + 1 post-compact text turn
+    print("compact_boundary markers are boundary ok")
+
+
+def test_bare_summary_counts_only_with_compact_markers():
+    """A bare type=summary line counts as a boundary only when the
+    transcript also carries real compaction markers ("accompanied by")."""
+    def make_objs(with_marker):
+        objs = [
+            _claude_msg("c1", "user", "Never push to main without asking."),
+            _claude_msg("c1", "assistant", "Got it."),
+        ]
+        if with_marker:
+            objs.append({"type": "system", "subtype": "compact_boundary",
+                         "sessionId": "c1"})
+        objs.append({"type": "summary", "sessionId": "c1",
+                     "summary": "Did some work."})
+        return objs
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p1 = os.path.join(tmp, "a.jsonl")
+        _write_jsonl(p1, make_objs(False))
+        assert compact_audit.find_boundaries(p1, "claude-code")[1] == []
+        p2 = os.path.join(tmp, "b.jsonl")
+        _write_jsonl(p2, make_objs(True))
+        turns, boundaries = compact_audit.find_boundaries(p2, "claude-code")
+        assert len(boundaries) == 1, boundaries
+        assert boundaries[0][0] == 2
+    print("bare summary gating on markers ok")
+
+
 def test_malformed_transcript_does_not_crash():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "bad.jsonl")
@@ -297,6 +394,9 @@ def test_malformed_transcript_does_not_crash():
 
 if __name__ == "__main__":
     test_boundary_detection()
+    test_session_title_lines_are_not_boundaries()
+    test_compact_boundary_markers_are_boundary()
+    test_bare_summary_counts_only_with_compact_markers()
     test_continuation_preamble_is_boundary()
     test_extraction_kinds_and_citations()
     test_dropped_reported_survived_not()

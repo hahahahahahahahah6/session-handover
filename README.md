@@ -113,9 +113,14 @@ One command installs it:
 ```bash
 $ session-handover hook-install precompact
 Installed PreCompact hook:
-  python3 /home/you/session-handover/hooks/precompact.py
+  /home/you/.venv/bin/python /home/you/.cache/session-handover/hooks/precompact.py
 Settings: /home/you/.claude/settings.json
 ```
+
+The registered command uses the absolute path of the interpreter that ran
+`hook-install` — never a bare `python3` — so the hook keeps working under
+pipx, venv, and uv installs, where the system `python3` has no
+`session_handover` package.
 
 This merges a `PreCompact` entry into `~/.claude/settings.json` without
 touching your other hooks (idempotent — re-running never duplicates it;
@@ -183,6 +188,34 @@ python3 tests/test_cli.py
 python3 tests/test_compact_audit.py
 python3 tests/test_precompact.py
 ```
+
+## Changelog
+
+### v0.3.1
+- **Fixed: `hook-install` no longer hardcodes `python3`.** The registered
+  hook command now uses the absolute path of the interpreter that ran
+  `hook-install` (`sys.executable`). Previously, pipx/venv/uv installs got
+  a `python3 <shim>` command whose interpreter had no `session_handover`
+  package, so the PreCompact hook fail-opened on every `/compact` while
+  the user believed they were protected.
+- **Fixed: session titles are no longer treated as compaction boundaries.**
+  Bare `{"type": "summary"}` lines are the `/resume` session titles, not
+  compactions; they only count as boundaries when the transcript also
+  carries real `/compact` markers (a `system` entry with subtype
+  `compact_boundary`, or a user message flagged `isCompactSummary`).
+  Previously, any titled session made the audit report every earlier rule
+  as DROPPED. The continuation-preamble path is unchanged.
+
+### v0.3
+- PreCompact auto-handover: `hook-install precompact` registers a
+  fail-open PreCompact hook that writes
+  `HANDOVER.<session>.md` (handover + durable-item checklist) before
+  `/compact` runs.
+
+### v0.2
+- Compaction diff audit: `audit-compact` extracts durable items
+  (rules, TODOs, decisions, preferences) from pre-compact turns and
+  checks them against the compaction summary via token overlap.
 
 ## License
 
