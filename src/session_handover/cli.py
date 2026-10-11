@@ -11,6 +11,7 @@ import sys
 
 from . import parsers
 from . import compact_audit
+from . import compaction_matrix
 from . import precompact
 from . import snapshot
 from . import sessionend
@@ -192,6 +193,59 @@ def cmd_hook(args):
     return sessionend.sessionend_main(out=args.out, fmt=args.format)
 
 
+def cmd_compact_matrix(args):
+    if args.harness:
+        try:
+            h = compaction_matrix.get(args.harness)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        lines = ["# %s -- compaction semantics" % h["name"], "",
+                 "- **Trigger:** %s" % h["trigger"], "",
+                 "- **Mechanism:** %s" % h["mechanism"], "",
+                 "- **Survives:** %s" % "; ".join(h["survives"]), "",
+                 "- **Drops:** %s" % "; ".join(h["drops"]), "",
+                 "- **Durable anchor:** %s" % h["anchor"], "",
+                 "- **Transcript audit:** %s" % h["audit"],
+                 "- **Confidence:** %s" % h["confidence"],
+                 "- **Evidence:** %s" % h["evidence"], ""]
+        print("\n".join(lines))
+        return 0
+    compare_pair = None
+    if args.compare:
+        if len(args.compare) != 2:
+            print("--compare takes exactly two harness ids, e.g. "
+                  "--compare claude-code codex-cli", file=sys.stderr)
+            return 2
+        try:
+            compare_pair = tuple(args.compare)
+            compaction_matrix.get(compare_pair[0])
+            compaction_matrix.get(compare_pair[1])
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(compaction_matrix.render_markdown(
+                compare_pair=compare_pair))
+        print("Wrote %s (%d harnesses)" % (
+            args.out, len(compaction_matrix.harnesses())))
+    else:
+        print(compaction_matrix.render_terminal())
+        if compare_pair:
+            c = compaction_matrix.compare(*compare_pair)
+            a_name = compaction_matrix.get(compare_pair[0])["name"]
+            b_name = compaction_matrix.get(compare_pair[1])["name"]
+            print("")
+            print("drops only in %s:" % a_name)
+            for d in c["drops_only_in_a"] or ["(none -- same drop profile)"]:
+                print("  - %s" % d)
+            print("drops only in %s:" % b_name)
+            for d in c["drops_only_in_b"] or ["(none -- same drop profile)"]:
+                print("  - %s" % d)
+    return 0
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="session-handover",
@@ -306,6 +360,21 @@ def build_parser():
                     help="Write to this file (or directory) instead of the "
                          "default ~/.cache/session-handover/sessionend/.")
     ph.set_defaults(func=cmd_hook)
+
+    pm2 = sub.add_parser("compact-matrix",
+                         help="Cross-harness compaction semantics: what each "
+                              "coding harness drops and keeps when it "
+                              "compacts, and where to pin durable state.")
+    pm2.add_argument("--out", metavar="MATRIX.md",
+                     help="Write the full Markdown report to file instead "
+                          "of printing the terminal table.")
+    pm2.add_argument("--compare", nargs=2, metavar=("HARNESS_A", "HARNESS_B"),
+                     help="Diff two harnesses' drop/survive profiles, e.g. "
+                          "--compare claude-code codex-cli.")
+    pm2.add_argument("--harness", metavar="ID",
+                     help="Show one harness's full semantics, e.g. "
+                          "--harness codex-cli.")
+    pm2.set_defaults(func=cmd_compact_matrix)
     return p
 
 

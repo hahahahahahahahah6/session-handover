@@ -47,6 +47,20 @@ _CONTINUATION_PREFIXES = (
 # Fallback markers for Codex-shaped or otherwise unknown transcripts.
 _COMPACT_MARKERS = ("compacted", "compacting", "/compact")
 
+# Codex CLI compaction checkpoints (undocumented, from community
+# observation of the CLI's source and session captures, v0.5):
+#   - remote v1: the compaction summary becomes an assistant message
+#     starting "**CONTEXT CHECKPOINT - <date>** ...";
+#   - local fallback: history is rebuilt as retained user messages plus a
+#     user message starting "another language model started to solve this
+#     problem ..." (the summary_prefix), carrying the handoff summary;
+#   - a response item with type "compaction" marks the boundary directly.
+_CODEX_CHECKPOINT_PREFIXES = (
+    "context checkpoint",                      # "**CONTEXT CHECKPOINT - ..."
+    "another language model started to solve",  # local fallback prefix
+    "compacted summary",                        # alternate phrasing
+)
+
 
 def _has_compact_markers(path):
     """True if the transcript contains real /compact evidence.
@@ -118,11 +132,23 @@ def _claude_events(path, summaries_are_boundaries=True):
 def _codex_events(path):
     """Yield (kind, text) events for a Codex CLI transcript.
 
-    Codex has no documented compaction shape; this is best-effort: a
-    summary-typed payload, or a message whose text looks like a compaction
-    marker, counts as a boundary. If nothing matches, no boundary is found
-    and the caller fails soft.
+    Codex has no documented compaction shape; this is best-effort across
+    the known checkpoint forms (v0.5):
+
+      1. remote v1: an assistant message starting "**CONTEXT CHECKPOINT";
+      2. local fallback: a user message starting "another language model
+         started to solve this problem" (summary_prefix + handoff);
+      3. a response item with type "compaction";
+      4. legacy fallback: any message mentioning compaction markers.
+
+    A bare user "/compact" command line is NOT itself a boundary -- it is
+    the trigger, not the replacement. It arms a pending flag: the next
+    checkpoint-shaped message becomes the boundary. If no checkpoint
+    message follows, the flag is dropped silently (fail-soft: a missed
+    boundary is a silent miss, not a crash). If nothing matches, no
+    boundary is found and the caller fails soft.
     """
+    pending_compact = False
     for obj in parsers._lines(path):
         if obj.get("type") != "response_item":
             continue
@@ -130,22 +156,42 @@ def _codex_events(path):
         if not isinstance(p, dict):
             continue
         ptype = str(p.get("type", ""))
-        if "summary" in ptype:
+        if ptype == "compaction" or "summary" in ptype:
             for key in ("text", "summary", "content"):
                 text = p.get(key)
                 if isinstance(text, str) and text.strip():
                     yield ("summary", text.strip())
+                    pending_compact = False
                     break
             continue
         if ptype == "message":
             text = parsers._first_text(p.get("content", []))
             if not text.strip():
                 continue
-            lowered = text.strip().lower()
+            text = text.strip()
+            lowered = text.lower()
+            if (lowered == "/compact" or lowered.startswith("/compact ")
+                    or lowered.startswith("/compact\n")):
+                # The trigger line itself: arm, don't emit as a boundary.
+                pending_compact = True
+                continue
+            # Real Codex checkpoints carry markdown bold ("**CONTEXT
+            # CHECKPOINT - <date>**"); strip leading formatting so the
+            # prefix match fires on the actual words.
+            stripped = lowered.lstrip("*#_>` \t")
+            if any(stripped.startswith(cp)
+                   for cp in _CODEX_CHECKPOINT_PREFIXES):
+                yield ("summary", text)
+                pending_compact = False
+                continue
             if any(m in lowered for m in _COMPACT_MARKERS):
-                yield ("summary", text.strip())
-            else:
-                yield ("text", text.strip())
+                yield ("summary", text)
+                pending_compact = False
+                continue
+            # A checkpoint-less message after /compact is just a new turn:
+            # disarm rather than treating a real user message as a summary.
+            pending_compact = False
+            yield ("text", text)
 
 
 def find_boundaries(path, tool):

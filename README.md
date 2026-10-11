@@ -240,6 +240,51 @@ or wire it manually in `~/.claude/settings.json`:
 }
 ```
 
+## Cross-harness compaction matrix
+
+v0.5 widens the audit from Claude Code to every harness a session might
+be handed to. `compact-matrix` prints what each mainstream coding harness
+drops and keeps when it compacts — trigger, mechanism, survivors, drops,
+and the durable anchor where state should be pinned before it happens:
+
+```bash
+$ session-handover compact-matrix
+HARNESS       TRIGGER                                      MECHANISM                AUDIT
+claude-code   manual /compact; auto-compact near the...    Model-written summary... full
+codex-cli     manual /compact; automatic pre-turn and...   Remote v2 compaction...  partial
+gemini-cli    manual /compress; automatic under context... Model-written summary... none
+...
+```
+
+Highlights from the 8-harness registry (entries marked *measured* were
+counted in repeated runs; the rest are documented or community-reported):
+
+- **Claude Code** — project-root CLAUDE.md re-injected from disk (8/8
+  measured compactions); path-scoped rules and nested CLAUDE.md lost until
+  a matching file is read again; invoked skill bodies re-attached 6/8,
+  with stale text after an edit (rulestack).
+- **Codex CLI** — remote v2 compaction returns an encrypted blob plus
+  retained user messages; the local fallback drops all assistant messages
+  and the summary becomes a "CONTEXT CHECKPOINT" user message. Reasoning
+  items are filtered before summarization; the compaction prompt is
+  configurable since v0.50.
+- Gemini CLI (`/compress`), Aider, OpenCode, Copilot CLI (`/compact`,
+  auto at ~95%), Cursor, Cline — documented with their durable anchors
+  (GEMINI.md, committed files, AGENTS.md, copilot-instructions.md,
+  `.cursor/rules`, `.clinerules`).
+
+The full report — `session-handover compact-matrix --out MATRIX.md` —
+includes a comparison table, per-harness detail, and evidence notes.
+Pairwise diff: `--compare claude-code codex-cli`. Single harness:
+`--harness codex-cli`.
+
+The transcript audit engine is shared: `audit-compact` now also detects
+Codex's real compaction checkpoints (remote v1 `**CONTEXT CHECKPOINT**`
+assistant messages, the local fallback "another language model started
+to solve..." prefix, `type=compaction` response items) instead of only
+bare marker strings. A lone `/compact` command line is the trigger, not
+the replacement — it no longer fabricates a boundary by itself.
+
 ## How it differs
 
 - **vs session-hygiene's handoff card** — a session-hygiene Mod that
@@ -251,6 +296,11 @@ or wire it manually in `~/.claude/settings.json`:
   sync). session-handover stays a **lightweight stdlib-only CLI**:
   no workflow to adopt, no services to sync, just `snapshot` /
   `audit` / hooks you can run from any shell.
+- **Cross-tool, not Claude-only.** The audit engine started on Claude Code
+  transcripts, but the author bounces between tools — so v0.5 adds a
+  documented compaction-semantics matrix for 8 harnesses plus real Codex
+  `/compact` checkpoint detection. The handover survives the tool switch,
+  not just the compaction.
 
 ## How it works
 
@@ -309,12 +359,31 @@ side), and error signals. No LLM involved — it's fast, local, and private.
 python3 tests/test_parsers.py
 python3 tests/test_cli.py
 python3 tests/test_compact_audit.py
+python3 tests/test_compact_matrix.py
 python3 tests/test_precompact.py
 python3 tests/test_snapshot.py
 python3 tests/test_sessionend.py
 ```
 
 ## Changelog
+
+### v0.5.0
+- **Cross-harness compaction matrix: `compact-matrix`.** A documented
+  registry of 8 harnesses' compaction semantics (trigger, mechanism,
+  survives, drops, durable anchor, transcript-audit level), rendered as a
+  terminal table or full Markdown report (`--out MATRIX.md`), with
+  pairwise diffs (`--compare claude-code codex-cli`) and per-harness
+  detail (`--harness codex-cli`). Claude Code's entry is grounded in
+  rulestack's 8 measured compactions (root CLAUDE.md 8/8, skill body 6/8
+  with stale text after edit); Codex CLI's in the remote-v2 / local-
+  fallback behavior documented by the community.
+- **Codex `/compact` audit upgraded from marker strings to checkpoint
+  detection.** `audit-compact` now recognizes Codex's real checkpoint
+  shapes (remote v1 `**CONTEXT CHECKPOINT**` assistant message, local
+  fallback "another language model started to solve..." user message,
+  `type=compaction` response items). A bare `/compact` command line is
+  now treated as the trigger, not the replacement summary — it no longer
+  fabricates a boundary.
 
 ### v0.4.0
 - **Compaction state snapshots: `snapshot` + `audit`.** `snapshot -o
