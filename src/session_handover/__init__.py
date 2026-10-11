@@ -1,3 +1,3 @@
 """session-handover: hand off a coding-agent session to the next agent."""
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
