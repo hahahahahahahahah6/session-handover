@@ -12,6 +12,8 @@ import sys
 from . import parsers
 from . import compact_audit
 from . import precompact
+from . import snapshot
+from . import sessionend
 from .handover import generate
 
 
@@ -92,6 +94,12 @@ def cmd_audit_compact(args):
 
 
 def cmd_hook_install(args):
+    if args.which == "sessionend":
+        command = sessionend.sessionend_install()
+        print("Installed SessionEnd hook:")
+        print("  %s" % command)
+        print("Settings: %s" % sessionend.settings_path())
+        return 0
     command = precompact.hook_install()
     print("Installed PreCompact hook:")
     print("  %s" % command)
@@ -100,12 +108,88 @@ def cmd_hook_install(args):
 
 
 def cmd_hook_uninstall(args):
+    if args.which == "sessionend":
+        removed = sessionend.sessionend_uninstall()
+        if removed:
+            print("Removed SessionEnd hook.")
+        else:
+            print("SessionEnd hook was not installed; nothing to do.")
+        return 0
     removed = precompact.hook_uninstall()
     if removed:
         print("Removed PreCompact hook.")
     else:
         print("PreCompact hook was not installed; nothing to do.")
     return 0
+
+
+def cmd_snapshot(args):
+    snap = snapshot.take_snapshot(skills_dirs=args.skills_dir or None,
+                                  claude_md=args.claude_md,
+                                  memory_md=args.memory)
+    if args.out:
+        snapshot.save_snapshot(snap, args.out)
+        print("Wrote %s (%d skill(s), CLAUDE.md %s, MEMORY.md %s)" % (
+            args.out, len(snap["skills"]),
+            "yes" if snap["claude_md"] else "no",
+            "yes" if snap["memory_md"] else "no"))
+    else:
+        import json
+        print(json.dumps(snap, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _resolve_session(args):
+    sessions = parsers.discover()
+    if not sessions:
+        print("No sessions found.", file=sys.stderr)
+        return None
+    if args.session:
+        s = parsers.find_session(sessions, args.session)
+        if not s:
+            print("No session matching %r." % args.session, file=sys.stderr)
+            return None
+    else:
+        s = sessions[0]  # --last is the default
+    return s
+
+
+def cmd_audit(args):
+    try:
+        snap = snapshot.load_snapshot(args.snapshot)
+    except Exception as e:
+        print("Cannot load snapshot: %s" % e, file=sys.stderr)
+        return 2
+    summary_texts = None
+    if args.session or args.with_summary:
+        s = _resolve_session(args)
+        if s is None:
+            return 1
+        tool = {"claude-code": "claude-code", "codex": "codex"}.get(
+            s["tool"], "claude-code")
+        summary_texts = snapshot.latest_summaries(s["path"], tool)
+    result = snapshot.audit_against_snapshot(
+        snap, skills_dirs=args.skills_dir or None,
+        claude_md=args.claude_md, memory_md=args.memory,
+        summary_texts=summary_texts, snapshot_path=args.snapshot)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(snapshot.render_markdown(result))
+        print("Wrote %s (%d problem(s))" % (args.out,
+                                            len(result["problems"])))
+    else:
+        print(snapshot.render_terminal(result))
+    if args.fail_on_problem and result["problems"]:
+        return 1
+    return 0
+
+
+def cmd_hook(args):
+    if not args.session_end:
+        print("session-handover hook: nothing to do; pass --session-end.",
+              file=sys.stderr)
+        return 2
+    return sessionend.sessionend_main(out=args.out, fmt=args.format)
 
 
 def build_parser():
@@ -144,22 +228,84 @@ def build_parser():
     pa.set_defaults(func=cmd_audit_compact)
 
     pi = sub.add_parser("hook-install",
-                        help="Install the PreCompact hook: auto-write a "
-                             "handover (goal, timeline, durable-item "
-                             "checklist) before /compact runs. Merges into "
+                        help="Install a hook: auto-write a handover before "
+                             "/compact (precompact), or a lightweight handoff "
+                             "when a session ends (sessionend). Merges into "
                              "~/.claude/settings.json; idempotent.")
     pi.add_argument("which", nargs="?", default="precompact",
-                    choices=["precompact"],
-                    help="Which hook to install (only 'precompact' for now).")
+                    choices=["precompact", "sessionend"],
+                    help="Which hook to install.")
     pi.set_defaults(func=cmd_hook_install)
 
     pu = sub.add_parser("hook-uninstall",
-                        help="Remove the PreCompact hook installed by "
-                             "hook-install. Idempotent.")
+                        help="Remove a hook installed by hook-install. "
+                             "Idempotent.")
     pu.add_argument("which", nargs="?", default="precompact",
-                    choices=["precompact"],
-                    help="Which hook to uninstall (only 'precompact' for now).")
+                    choices=["precompact", "sessionend"],
+                    help="Which hook to uninstall.")
     pu.set_defaults(func=cmd_hook_uninstall)
+
+    ps = sub.add_parser("snapshot",
+                        help="Freeze pre-compaction state: skill bodies "
+                             "(~/.claude/skills or project skills/), "
+                             "CLAUDE.md, MEMORY.md. Take this BEFORE "
+                             "/compact.")
+    ps.add_argument("--skills-dir", action="append", metavar="D",
+                    help="Skill directory to scan (repeatable). Default: "
+                         "probe ~/.claude/skills, ./skills, "
+                         "./.claude/skills.")
+    ps.add_argument("--claude-md", metavar="PATH",
+                    help="Explicit CLAUDE.md path. Default: probe "
+                         "./CLAUDE.md, ~/.claude/CLAUDE.md, ~/CLAUDE.md.")
+    ps.add_argument("--memory", metavar="PATH",
+                    help="Explicit MEMORY.md path. Default: probe "
+                         "./MEMORY.md, ~/.claude/MEMORY.md, ~/MEMORY.md.")
+    ps.add_argument("-o", "--out", metavar="SNAP.json",
+                    help="Write the snapshot JSON to a file. Without -o, "
+                         "prints it to stdout.")
+    ps.set_defaults(func=cmd_snapshot)
+
+    pa2 = sub.add_parser("audit",
+                         help="After compaction: compare the current disk "
+                              "against a pre-compaction snapshot and report "
+                              "missing skill bodies, stale re-attaches, and "
+                              "CLAUDE.md new-text loss.")
+    pa2.add_argument("--snapshot", metavar="SNAP.json", required=True,
+                     help="Snapshot file written by `snapshot`.")
+    pa2.add_argument("--skills-dir", action="append", metavar="D",
+                     help="Override skill directories (default: the ones "
+                          "recorded in the snapshot).")
+    pa2.add_argument("--claude-md", metavar="PATH",
+                     help="Override CLAUDE.md path.")
+    pa2.add_argument("--memory", metavar="PATH",
+                     help="Override MEMORY.md path.")
+    pa2.add_argument("--session", metavar="ID",
+                     help="Cross-check CLAUDE.md new text against the "
+                          "compaction summary of this session (prefix ok; "
+                          "default: most recent session).")
+    pa2.add_argument("--with-summary", action="store_true",
+                     help="Same as --session for the most recent session.")
+    pa2.add_argument("--out", metavar="AUDIT.md",
+                     help="Write the Markdown report to file instead of "
+                          "printing the terminal summary.")
+    pa2.add_argument("--fail-on-problem", action="store_true",
+                     help="Exit 1 when any problem is found (for CI/hook "
+                          "use). Default is exit 0: audit, never blocks.")
+    pa2.set_defaults(func=cmd_audit)
+
+    ph = sub.add_parser("hook",
+                        help="Run a hook body directly (used by Claude Code "
+                             "hooks).")
+    ph.add_argument("--session-end", action="store_true",
+                    help="SessionEnd hook: write a lightweight handoff "
+                         "(unfinished tasks, key decisions, follow-ups). "
+                         "Reads hook JSON from stdin.")
+    ph.add_argument("--format", choices=["json", "markdown"], default="json",
+                    help="Handoff file format (default: json).")
+    ph.add_argument("--out", metavar="PATH",
+                    help="Write to this file (or directory) instead of the "
+                         "default ~/.cache/session-handover/sessionend/.")
+    ph.set_defaults(func=cmd_hook)
     return p
 
 
