@@ -141,6 +141,117 @@ compaction. Extraction is capped to the most recent 300 text turns
 (`SESSION_HANDOVER_WINDOW` to tune) so the hook stays fast on large
 transcripts.
 
+## Compaction state snapshots
+
+v0.3 prevents loss at `/compact` time. v0.4 audits what compaction did to
+your **files**, not just your transcript. Observed failure modes (8
+compaction runs against a real skill stack): 2/8 runs dropped a skill
+body that was in context before `/compact`; re-attached skill bodies came
+back as the **old** version even though the SKILL.md on disk had been
+edited mid-session; editing CLAUDE.md mid-session and then compacting
+left the summary carrying the old text and the new text gone from context.
+
+Before compacting, freeze the state:
+
+```bash
+$ session-handover snapshot -o /tmp/pre-compact.json
+Wrote /tmp/pre-compact.json (3 skill(s), CLAUDE.md yes, MEMORY.md no)
+```
+
+This records the full body + sha256 of every skill found in
+`~/.claude/skills` (or `./skills`, `./.claude/skills`), plus CLAUDE.md
+and MEMORY.md (paths probe defaults; override with `--skills-dir`,
+`--claude-md`, `--memory`).
+
+After compaction, audit the disk against the snapshot:
+
+```bash
+$ session-handover audit --snapshot /tmp/pre-compact.json
+session-handover snapshot audit
+snapshot taken: 2026-10-11T07:40:00+00:00
+problems: 1
+
+[STALE RE-ATTACH] /home/you/.claude/skills/deploy/SKILL.md
+  Skill 'deploy' was modified after the snapshot (mtime 2026-10-11
+  00:42:10) but its current content is byte-identical to the snapshot --
+  an older version appears to have been re-attached over mid-session edits.
+  fix: Re-apply any mid-session edits you made to
+  /home/you/.claude/skills/deploy/SKILL.md. ...
+```
+
+Three mechanical problem classes:
+
+- **Missing skill body** — in the snapshot, gone (or emptied) on disk
+  now. The full pre-compaction body is stored in the snapshot file, so
+  the suggested fix tells you exactly where to restore it from.
+- **Stale re-attach** — the file was modified after the snapshot but its
+  current content is byte-identical to the snapshot: an older version was
+  re-attached over your mid-session edits. Re-apply them (the snapshot
+  only holds the old version, so check your editor history).
+- **CLAUDE.md new text lost** — CLAUDE.md gained lines after the
+  snapshot. The audit shows the added lines (unified diff included in
+  `--out` Markdown) and tells you to verify them against the resumed
+  context. Pass `--session <id>` (or `--with-summary`) to cross-check the
+  added lines against the actual compaction summary: if the summary
+  doesn't contain them, the verdict upgrades from "verify" to "lost —
+  paste these back".
+
+`--out AUDIT.md` writes the full Markdown report; `--fail-on-problem`
+exits 1 when anything is found (for CI/hook use). Like `audit-compact`,
+the default is exit 0 — an audit never blocks.
+
+## SessionEnd auto-handoff
+
+`session-handover hook --session-end` is the SessionEnd counterpart to
+the PreCompact hook: when a session ends, it extracts unfinished tasks,
+key decisions, and follow-ups from the transcript tail and writes a
+lightweight handoff file (`~/.cache/session-handover/sessionend/`,
+JSON by default, `--format markdown` available). Fail-open, exits 0
+always. Run it from a hook, or by hand:
+
+```bash
+$ echo '{"session_id":"abc","transcript_path":"/path/to/transcript.jsonl"}' \
+  | session-handover hook --session-end --format markdown
+```
+
+Install it into Claude Code with one command (idempotent; merges into
+`~/.claude/settings.json` without touching other hooks):
+
+```bash
+$ session-handover hook-install sessionend
+```
+
+or wire it manually in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/python /path/to/hooks/sessionend.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## How it differs
+
+- **vs session-hygiene's handoff card** — a session-hygiene Mod that
+  carries state between sessions on the same machine. It does
+  session-to-session handoff only; it doesn't audit what `/compact`
+  dropped, and it has nothing to say about skill bodies or CLAUDE.md
+  edits. session-handover owns the **compaction diff** boundary instead.
+- **vs SpecWeave 3** — a heavy spec-first workflow (11 skills, JIRA
+  sync). session-handover stays a **lightweight stdlib-only CLI**:
+  no workflow to adopt, no services to sync, just `snapshot` /
+  `audit` / hooks you can run from any shell.
+
 ## How it works
 
 Claude Code stores each session as a `.jsonl` transcript; Codex CLI stores
@@ -180,6 +291,18 @@ side), and error signals. No LLM involved — it's fast, local, and private.
   inherits the audit's extraction limits — it is a heuristic safety net,
   not a guarantee that nothing was lost.
 
+- **The snapshot audit is mechanical, not semantic.** It compares the disk
+  against the snapshot; it cannot see the resumed context itself, so a
+  "lost" verdict about context should be confirmed by skimming the
+  session. The stale-reattach check needs the file's mtime to be clearly
+  newer than the snapshot (2s margin) — a same-second rewrite won't flag.
+  Skill bodies are stored verbatim in the snapshot JSON, so keep snapshot
+  files somewhere sensible and don't commit ones containing secrets.
+- **The SessionEnd handoff is a recall floor.** Buckets (unfinished /
+  decisions / follow-ups) come from the same heuristic patterns as the
+  compaction audit — subtly-phrased items are missed, and a rule is filed
+  under "follow-ups & constraints", not magically understood.
+
 ## Development
 
 ```bash
@@ -187,9 +310,31 @@ python3 tests/test_parsers.py
 python3 tests/test_cli.py
 python3 tests/test_compact_audit.py
 python3 tests/test_precompact.py
+python3 tests/test_snapshot.py
+python3 tests/test_sessionend.py
 ```
 
 ## Changelog
+
+### v0.4.0
+- **Compaction state snapshots: `snapshot` + `audit`.** `snapshot -o
+  SNAP.json` freezes skill bodies (hash + full content), CLAUDE.md, and
+  MEMORY.md before `/compact`; `audit --snapshot SNAP.json` compares the
+  post-compact disk against it and reports three mechanical problems —
+  missing skill body (restorable from the snapshot), stale re-attach (file
+  modified after the snapshot but byte-identical to it), and CLAUDE.md
+  new-text loss (added lines shown, optionally cross-checked against the
+  compaction summary via `--session`). `--fail-on-problem` for CI/hook
+  use; default exit 0, never blocks.
+- **SessionEnd auto-handoff: `hook --session-end`.** Writes a lightweight
+  handoff (unfinished tasks, key decisions, follow-ups; JSON or Markdown)
+  when a session ends. Fail-open, exits 0. `hook-install sessionend` /
+  `hook-uninstall sessionend` register it in `~/.claude/settings.json`;
+  the README shows the manual hook config too.
+- New "How it differs" section: vs session-hygiene's handoff card
+  (session-to-session Mod, no compaction audit) and vs SpecWeave 3 (heavy
+  spec-first workflow) — this tool stays a lightweight stdlib-only CLI on
+  the compaction-diff boundary.
 
 ### v0.3.1
 - **Fixed: `hook-install` no longer hardcodes `python3`.** The registered
